@@ -100,10 +100,11 @@ sudo ./15-watch.sh start          # 常驻记录 USB 事件 + 断联瞬间现场
 ```
 开机
  └─ E398Switcher.kext（AuxKC，内核态）
-     ├─ E398Loader 挂 IOResources，无条件启动
-     └─ 内核线程：每秒扫 IOUSBHostInterface
-         ├─ 找到 12d1:1505 → seize / terminate 掉 mass-storage 占用者
-         └─ 往 bulk OUT 0x01 异步写 31 字节 UFI 报文 → 设备重枚举为 12d1:1506
+     ├─ E398Loader 挂 IOResources，无条件启动（保证 kext 在 USB 枚举前就位）
+     ├─ 热插时：E398Switcher personality（score 1000000）直接接管 08/06/50 接口
+     ├─ 开机已插时：接口被 mass-storage 抢先绑定，由 E398Loader 的线程扫描接管
+     │   └─ open → 写 31 字节 UFI 报文 → 立刻 close → 设备重枚举为 12d1:1506
+     └─ 两条路径互斥（gActiveSwitchers），同一时刻只有一个在动
                         ↓
 拨号
  └─ 5-ppp-dial.sh（用户态，不需要额外 kext）
@@ -120,9 +121,9 @@ sudo ./15-watch.sh start          # 常驻记录 USB 事件 + 断联瞬间现场
 
 - **模式切换不持久**：USB 不断电就还是 1506；**物理拔插必回 1505**，
   但 kext 会自己再切一次（1~3 秒）。重启不影响。
-  kext 的监视线程是**永久**运行的，且 1.6.0 起不会再"放弃重试"：
-  发一轮报文 → 放开接口 → 下一轮再抢再发，每 60 秒打一条心跳日志。
-  （1.5.0 发满 6 次报文后会永久放弃且不再打日志，断联后表现就是"一直停在 1505"。）
+  kext 的监视线程是**永久**运行的：接口一出现就由 personality 接管（1.7.0 起
+  personality 和兜底路径互斥，不再互抢会话），发一轮报文 → 立刻放开接口 →
+  失败就按 2s / 4s / 8s 快重试，之后每 30 秒一次，并每 60 秒打一条心跳。
 - **`--down` 断不干净**：`ATD` 之后 if0 变成纯数据管道，modem 固件不解析 AT。
   `+++`/`ATH`/重枚举/`SetConfiguration(0→1)`/USB 挂起全部实测无效，
   只有**拔插断电**真的拆 PDP。脚本用"复用旧会话"绕过。

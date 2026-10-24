@@ -46,21 +46,30 @@ USB 内核日志末尾。按下面的表对号入座：
 
 ### 断联之后为什么有时切不回 1506
 
-kext 1.5.0 有一个确定的缺陷：报文发满 6 次后 `sendCount` 不再清零，
-而清零只发生在"换接口对象"和"看不见 1505"两个分支里 —— 设备一直停在 1505 时
-这两个分支都不会执行，于是**永久放弃重试，并且不再打任何日志**。
-同时它还一直 `open()` 着接口不放手（`ioreg` 里能看到
-`"UsbExclusiveOwner" = "E398Loader"`），把设备的重枚举也堵住了。
+分两个阶段的历史问题：
 
-1.6.0 改成"发一轮 → 放开接口 → 下一轮再抢再发"的无限循环，并加了 60 秒心跳：
+**1.5.0** 报文发满 6 次后 `sendCount` 不再清零，而清零只发生在"换接口对象"和
+"看不见 1505"两个分支里 —— 设备一直停在 1505 时这两个分支都不执行，于是
+**永久放弃重试，并且不再打任何日志**；同时一直 `open()` 着接口不放手
+（`ioreg` 里 `"UsbExclusiveOwner" = "E398Loader"`），把重枚举也堵住了。
+
+**1.6.0** 改成"发一轮 → 放开接口 → 再抢再发"，但留下了新的结构问题：
+`E398Switcher`（personality）和 `E398Loader`（常驻线程）**各自独立**地 open/seize
+同一个接口，等于两个自己人每 1~3 秒互相踢一次会话；而且报文重发没有节制。
+
+1.7.0 用互斥（`gActiveSwitchers`）+ 自己人识别 + 快慢两级退避解决：
 
 ```bash
-kmutil showloaded | grep e398            # 版本必须是 1.6.0
+kmutil showloaded | grep e398            # 版本必须是 1.7.0
+ioreg -r -n E398Loader -w0 | grep E398   # E398ActiveSwitchers / E398Attempts / E398Timeouts
 # 有「心跳 Ns」= 线程活着；有「检测到 12d1:1505（设备刚复位或刚插入）」= 抓到复位时刻
 log show --last 30m --predicate 'eventMessage CONTAINS "E398Switcher"' | tail -20
 ```
 
-判断"线程是活着但切不动"还是"线程根本没跑"，就看有没有心跳（1.6.0 每 60 秒一条）。
+判断"线程是活着但切不动"还是"线程根本没跑"，就看有没有心跳（每 60 秒一条）。
+
+`E398ActiveSwitchers` 的含义：`1` = personality 已接管（主路径）；一直是 `0` 说明
+personality 没匹配上，走的是 loader 兜底路径 —— 两条路都能切，但主路径更干净。
 
 ---
 
@@ -78,8 +87,9 @@ ioreg -p IOUSB -w0 -l | grep -A2 UsbExclusiveOwner
 |---|---|---|
 | `showloaded` 里没有 e398 | kext 根本没进内核 | 见下一节 |
 | `showloaded` 有，但 `E398Loader` 计数为 0 | **假加载**：kmod start 失败被回滚 | 见下一节（`0xdc008007`） |
-| `UsbExclusiveOwner` 是 `E398Loader` 且一直不变 | 1.5.0 的 bug：发满 6 次就永久放弃 + 占着接口不放 | 升级到 1.6.0（`./build-kext.sh && sudo ./6-install-switcher.sh`，重启） |
-| `UsbExclusiveOwner` 是 `IOUSBMassStorageDriver` | 占用者没被赶走 | 拔插；1.6.0 会先 `open(kIOServiceSeize)` 再异步 `terminate` |
+| `UsbExclusiveOwner` 是 `E398Loader` / `E398Switcher` 且一直不变 | 1.6.0 及更早：两条路径互抢会话 | 升级到 1.7.0（`./build-kext.sh && sudo ./6-install-switcher.sh`，重启） |
+| `UsbExclusiveOwner` 是 `IOUSBMassStorageDriver` | 占用者没被赶走 | 拔插；1.7.0 会先 `open(kIOServiceSeize)` 再异步 `terminate` |
+| `E398ActiveSwitchers` 一直是 0 | personality 没匹配上，走 loader 兜底 | 功能正常；想恢复主路径就拔插一次 modem |
 | 两者都有，但设备仍 1505 | 线程没抢到接口 | 拔插一次 modem；仍不行看内核日志里的 `open 失败` 与报文返回码 |
 
 查看它到底做了什么（`--last boot` 会扫本次开机全部日志，很慢；先看最近 30 分钟）：
@@ -132,7 +142,7 @@ log show --last 30m --predicate 'eventMessage CONTAINS "E398Switcher"' | tail -3
 ```cpp
 extern "C" kern_return_t E398KmodStart(kmod_info_t *ki, void *d);
 extern "C" kern_return_t E398KmodStop(kmod_info_t *ki, void *d);
-KMOD_EXPLICIT_DECL(E398Switcher, "1.6.0", E398KmodStart, E398KmodStop)
+KMOD_EXPLICIT_DECL(E398Switcher, "1.7.0", E398KmodStart, E398KmodStop)
 ```
 
 自检（不用装，直接看二进制）：

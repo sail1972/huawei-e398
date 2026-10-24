@@ -82,7 +82,7 @@ elapsed
 echo
 echo -e "${B}=== 2. 驱动内核日志 ===${N}"
 STEP_T0=$(date +%s)
-# 默认只取最近 30 分钟；1.6.0 之后每 60 秒有一条心跳，所以「最近 30 分钟一条都没有」
+# 默认只取最近 30 分钟；1.7.0 起每 60 秒有一条心跳，所以「最近 30 分钟一条都没有」
 # 本身就说明线程没在跑（而不是"没事发生"）。
 if [ "${KC_LOG_FULL:-0}" = "1" ]; then
   OUT=$(kc_run_timeout 240 log show --last boot --predicate 'eventMessage CONTAINS "E398Switcher"' --style compact | tail -15)
@@ -94,12 +94,12 @@ if [ -n "$OUT" ]; then
   echo
   echo "  提示：找这几条判断状态"
   echo "    · 「检测到 12d1:1505（设备刚复位或刚插入）」 → 断联/重枚举的时刻"
-  echo "    · 「心跳 Ns」                                  → 线程活着（1.6.0 起每 60 秒一条）"
+  echo "    · 「心跳 Ns」                                  → 线程活着（每 60 秒一条）"
   echo "    · 「第 N 次下发 31 字节切换报文」              → 正在尝试切换，看返回码"
 else
   echo "  （最近 ${KC_LOG_MIN} 分钟没有 E398Switcher 日志）"
   if [ "$LOADED" -eq 1 ]; then
-    echo -e "  ${Y}驱动在，但 30 分钟没日志${N} —— 1.6.0 会每 60 秒打一条心跳，"
+    echo -e "  ${Y}驱动在，但 30 分钟没日志${N} —— 1.7.0 会每 60 秒打一条心跳，"
     echo "  没有心跳说明监视线程没在跑（旧版 1.5.0 没有心跳，属正常）。"
     echo "  想看完整历史：./7-verify.sh --full"
   else
@@ -125,7 +125,7 @@ EXC=$(echo "$IOREG_HOST" | grep -A40 '"USB Product Name" = "HUAWEI Mobile"' | gr
 if [ -n "$EXC" ]; then echo "    $EXC"; else echo "    （接口当前无人独占 —— 机会窗口）"; fi
 printf "  E398Switcher 服务实例      : "
 if kc_has_class E398Switcher; then
-  echo "有（它已经抢到接口，正在发报文）"
+  echo "有（personality 已挂上接口）"
 else
   echo "无"
 fi
@@ -134,6 +134,16 @@ if kc_has_class IOUSBMassStorageInterfaceNub; then
   echo "在（接口被苹果存储驱动占着）"
 else
   echo "不在（接口空闲）"
+fi
+# 1.7.0 起驱动把自己的计数发布在 E398Loader 的 IORegistry 属性上，
+# 不用翻日志就能判断「有没有在发报文」「发了几次」「有没有卡在超时」。
+printf "  驱动计数                   : "
+CNT=$(ioreg -r -n E398Loader -w0 2>/dev/null | grep -o '"E398[A-Za-z0-9]*" = [-0-9]*' | tr '\n' ' ')
+if [ -n "$CNT" ]; then
+  echo
+  echo "    $CNT"
+else
+  echo "（读不到 —— 驱动没加载，或还是 1.6.0 及更早）"
 fi
 elapsed
 
@@ -188,13 +198,15 @@ elif echo "${PROBE:-}" | grep '1505' | grep -qE ': 在$'; then
   else
     echo -e "  ${Y}⚠ 驱动已真正载入，但还是 1505${N}"
     echo
-    echo "  1.5.0 有一个确定的缺陷会造成这个现象（断联后永久放弃重试，且不打日志）："
-    echo "    发满 6 次报文后 sendCount 不再清零，而设备停在 1505 时清零分支永远不执行。"
-    echo -e "  → 升级到 1.6.0： ${G}./build-kext.sh && sudo ./6-install-switcher.sh${N}，然后重启"
+    echo "  已知的两个结构性缺陷会造成这个现象："
+    echo "    · 1.5.0：发满 6 次报文后永久放弃重试，且不再打任何日志"
+    echo "    · 1.6.0：personality 与 loader 两条路径互抢同一个接口会话"
+    echo -e "  → 升级到 1.7.0： ${G}./build-kext.sh && sudo ./6-install-switcher.sh${N}，然后重启"
     echo
-    echo "  如果已经是 1.6.0，看第 2 节的心跳日志："
-    echo "   · 有「心跳」但「第 N 次下发…-> 0xE00002xx」 → 报文发不出去，看返回码"
-    echo "   · 完全没有心跳                              → 线程没跑，把第 1/2 节发我"
+    echo "  如果已经是 1.7.0，看第 2 节的心跳日志和第 4 节的接口归属："
+    echo "   · 有「心跳」但「第 N 次下发…返回 0xE00002xx」 → 报文发不出去，看返回码"
+    echo "   · 完全没有心跳                                → 线程没跑，把第 1/2 节发我"
+    echo "   · 心跳里有「接口已被独占 / 等它放手」           → 有外部驱动占着，拔插一次"
   fi
   echo
   echo -e "  回滚： ${B}sudo ./9-uninstall.sh${N} 然后重启"

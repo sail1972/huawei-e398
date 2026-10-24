@@ -57,72 +57,142 @@
 
 ---
 
-## 4. kext 的设计（v1.6.0）
+## 4. kext 的设计（v1.7.0）
 
-### 为什么不是"注册一个高分 personality 就完事"
+### 三层职责，各管一段
 
-`Info.plist` 里确实有一套 `IOProbeScore = 1000000` 的 personality
-（`IOUSBHostInterface` + `idVendor 0x12d1` + `idProduct 0x1505` + `bInterfaceClass 8`），
-但**它抢不过**开机时先到先得的 `IOUSBMassStorageInterfaceNub`（score 50000）。
+| 层 | 谁 | 作用 |
+|---|---|---|
+| 加载锚点 | `E398Loader`（personality 挂 `IOResources`） | 保证 kext 在 USB 枚举**之前**就进内核 |
+| 主路径 | `E398Switcher`（personality 挂 `IOUSBHostInterface`，score 1000000） | 接口出现时归它，直接 open → 发报文，不扫描 |
+| 兜底 | `E398Loader` 的线程 | 仅当 `gActiveSwitchers == 0`（主体没匹配上）才扫描接管；平时只发心跳 |
 
-实测：即使分数高 20 倍，接口被占住时匹配依然输 —— 因为对方是"开机即匹配"，
-我们的 kext 是后来才进内核的。所以真正的执行者是第二套 personality：
-
-```xml
-E398Loader: IOProviderClass = IOResources, IOClass = E398Loader
-```
-
-挂 `IOResources` 意味着**无条件加载**，不参与任何 USB 匹配。它在 `start()` 里起一个
-**内核线程**，每秒扫描一遍所有 `IOUSBHostInterface`：
+**实测：哪条路径在真正跑**（本机 macOS 15.8.1）
 
 ```
-找到 12d1:1505 的接口
-  ├─ 先试 intf->open(client, kIOServiceSeize, NULL)      ← 让 IOService 把占用者撤下
-  ├─ 失败则找子节点类名含 "MassStorage" 的服务，terminate() 异步终止
-  ├─ 仍无占用者 → 异步 pipe->io() 写 31 字节
-  ├─ 按住接口 3 秒（等异步传输收尾）→ close() 放手 → 下一轮重新抢
-  └─ 每 60 秒打一次心跳（看到几个 1505 / 是否持有接口 / 累计发报文次数）
+ioreg -c IOUSBHostInterface -l | grep -A2 UsbExclusiveOwner
+  "UsbExclusiveOwner" = "E398Loader"      ← 实际干活的是兜底路径
+ioreg -c E398Switcher | wc -l  → 0        ← personality 一个实例都没有
 ```
 
-### 1.5.0 的三个硬伤（1.6.0 全部修掉）
+原因：**开机时设备已经插着**。USB 枚举发生在 kext 进内核之前，那时匹配表里没有我们，
+`IOUSBMassStorageDriver`（score 50000）先把接口绑走；IOService 的匹配是一次性的，
+我们后来再注册 personality 也不会重新匹配已有服务。所以：
 
-长期使用后出现「经常断、断了就再也切不上去、而且没有任何日志」，逐行读代码后定位到三处：
+| 场景 | 谁在干活 |
+|---|---|
+| 开机器时 modem 已插 | mass-storage 先绑定 → **loader 兜底路径** |
+| 开机后插 / 拔插 modem | kext 已在内存里，1000000 分胜出 → **personality 主路径** |
 
-**① 永久放弃，且不留痕迹（最致命）**
+这也是 1.7.0 保留两层的原因：两条路必须都能跑通，而且**同一时刻只能有一个在跑**
+（`gActiveSwitchers` 互斥 + `e398IsOurs()` 不抢自己）。两者的切换逻辑是同一个函数
+`e398TrySwitch()`，所以修一处两边都受益。
+
+### 1.6.0 的五个问题（1.7.0 全部修掉）
+
+**① 两条路径互抢同一个会话**
+
+`E398Switcher` 和 `E398Loader` 各自持有一份 `E398State`，各自对同一个
+`IOUSBHostInterface` 做 `open` / `kIOServiceSeize`。personality 每次 open 失败都会
+seize —— 抢的对象可能是自己的 loader。热插场景下两个"自己人"会互相踢会话，
+USB 栈被搅得没法稳定。
+1.7.0：全局 `gActiveSwitchers` 互斥；且 open 失败时先看 `UsbExclusiveOwner` 是不是
+自己（`e398IsOurs()`），是就退避 500ms，**绝不对自己 seize**。
+
+**② `open()` 之后 close 被跳过 → 内核对象泄漏（实测 17 天没释放）**
+
+1.6.0 在接口已经 `inactive` 时跳过 `close()`，理由是"对失效对象 close 没意义"。
+实际上 `open()` 建立的是 IOKit 会话（open count + client 引用），不 close 就永远不关。
+本机现场：
+
+```
+IOUSBHostInterface@0  <class IOUSBHostInterface, !registered, !matched, inactive,
+                       busy 1 (1535389 ms), retain 6>
+  "idProduct"       = 5381            ← 1505 时代的对象，早就该消失
+  "UsbExclusiveOwner" = "E398Loader"
+```
+
+开机 17 天、`busy 1` 一直挂着。每拔插一次就多留一个，而且设备的 USB 会话记账里
+始终有个未关闭的 client。Linux 对应的是 `usb_driver_release_interface()`，
+语义就是"无论设备什么状态都解绑"。
+
+更麻烦的是连带效应：这个残留对象的 PID 还是 5381、class 还是 8，
+`e398IsTarget()` 会把**每一次扫描**都判定成"1505 还在"，于是
+`found` 永远大于 0、状态永远不重置、每秒对它 `open()` 一次（必然失败）——
+既刷日志又让"监视中"永远不出现。
+
+1.7.0 两个修法：
+- **无条件 `close()`**。`close()` 是本地状态操作（减 open count、唤醒等待者），
+  不涉及设备往返，不会像 `terminate(Synchronous)` 那样阻塞。
+- `e398IsTarget()` **先看 `isInactive()`**，失效对象直接跳过。
+
+**③ `stop()` 释放了工作线程还在用的指针**
 
 ```cpp
-if (st->held == intf) {
-    if (st->sendCount >= E398_MAX_SEND) return false;   // ← 6 次之后永远走这里
-    st->sendCount++;
-    ...
+void E398Switcher::stop(IOService *provider) {
+    fInterface->release();      // ← 线程可能正在 open/close 它
+    fInterface = NULL;
 }
 ```
 
-`sendCount` 只在两个地方清零：换接口对象时、以及"看不见 1505"时。而设备**一直停在
-1505** 的时候，这两个分支都不会执行 —— 于是发满 6 次后这个设备实例被永久放弃，
-`IOLog` 一行都不再打。表现就是 `5-ppp-dial.sh` 喊"25 秒没切到 1506"、
-`7-verify.sh` 第 2 节什么日志都没有，看起来像线程死了，其实是它在空转。
+拔线时 provider 被 `terminate()` 就会走到这里 —— use-after-free，能直接 panic。
+1.7.0：`fProvider` 只由工作线程持有和释放，`stop()` 只置 `fStop`。
 
-现场证据（`ioreg`）：
+**④ 报文重发没有节制**
+
+设备卡在 1505 时每 ~4 秒发一次 CBW，一整晚就是上万次。固件在"切换中"反复收到新的
+SCSI 命令，反而更容易挂死。Linux 的 usb_modeswitch 是**每个配置只发一次**。
+1.7.0：2s / 4s / 8s 三次快重试，之后固定 30 秒一次，每次都有日志。
+
+**⑤ 异步传输的内存生命周期**
+
+超时后 `pipe->io()` 的回调仍可能到达，此时若已 `IOFree` 就是写已释放内存。
+1.7.0 用 `abandoned` 标志把释放责任交给回调，且回调**先读 abandoned 再写 done**，
+两边都不会释放两次。
+
+### 主流程（1.7.0）
 
 ```
-"UsbExclusiveOwner" = "E398Loader"      ← 它自己占着接口，永远不放
+personality start()  →  gActiveSwitchers++  →  起内核线程（500ms 后开始）
+  └─ 循环：接口还没失效？
+       ├─ open(this, 0, NULL)
+       │    ├─ 成功 → 发报文
+       │    ├─ 失败且占用者是自己 → 退避 500ms（不抢）
+       │    ├─ 失败且有外部占用者 → seize 一次；不行就异步 terminate 一次
+       │    └─ 失败且无占用者属性 → 退避 1s（设备在复位）
+       ├─ 发报文：异步提交 → 每 10ms 查一次 done → 最多等 2.5s
+       ├─ 立刻 close()（让设备能重枚举，对应 Linux 的 release_interface）
+       └─ 退避：2s / 4s / 8s / 之后 30s
+  └─ 接口失效 or fStop → 释放 fProvider，线程退出
 ```
 
-**② 长期占着接口，把重枚举堵住**
+### 只碰大容量存储接口
 
-报文发出后一直 hold 着 `IOUSBHostInterface`。而切换模式必定伴随 USB 复位/重枚举，
-接口会话被我们占着，macOS 撤不掉，切换就卡在半路。
-1.6.0 改成：发完按住 3 轮（> 2 秒的 IO 超时，让异步传输收尾）→ `close()` → 下一轮重新抢。
+`e398IsTarget()` 除了 VID/PID，还要求 `bInterfaceClass == 8`。
+这条直接对应 Linux `option_probe()` 里的：
 
-**③ 在内核线程里同步 terminate**
+```c
+/* Never bind to the CD-Rom emulation interface */
+if (iface_desc->bInterfaceClass == USB_CLASS_MASS_STORAGE)
+        return -ENODEV;
+```
 
-`terminate(kIOServiceSynchronous)` 会阻塞到被终止的服务真的停下来，而这个等待依赖
-USB workloop。workloop 一旦被复位流程占住，我们的线程就永久挂在那里 —— 线程死了，
-从此没有任何人重试。改成异步 `terminate()`：本轮返回，下一轮再检查占用是否解除。
+1505 模式下除了虚拟光驱，还有 `ff/01/0x` 的 AT 接口（VID/PID 同样是 12d1:1505）。
+只按 VID/PID 过滤会把 AT 接口也扫进来，对它的 bulk OUT 端点重放 SCSI 报文 —— 纯捣乱。
 
-另外补了 60 秒心跳。以前"没有日志"无法区分「没事发生」和「线程死了」，
-排查时只能靠猜；现在心跳里同时给出看到几个 1505、是否持有接口、累计发了几次报文。
+### 与 Linux 的完整对照
+
+| 环节 | Linux | macOS / 本项目 | 说明 |
+|---|---|---|---|
+| 谁绑定存储接口 | `usb-storage`（会绑上） | 不绑：personality score 1000000 > 50000 | macOS 没有 `usb_driver_release_interface`，只能在匹配阶段抢 |
+| 解绑占用者 | `usb_driver_release_interface()` | `open(kIOServiceSeize)` / `terminate()` | 仅当匹配输了才用，属兜底 |
+| 发报文 | `usb_modeswitch` 写 `MessageEndpoint=0x01` | 描述符里找第一个 bulk OUT | 不硬编码端点号，实测同为 0x01 |
+| 报文内容 | `55534243123456780000000000000011062000000100000000000000000000` | 逐字节相同（31 字节） | 已用脚本比对，完全一致 |
+| 等结果 | `CheckSuccess=20` 轮询目标 PID | 监视 `IOUSBHostInterface::isInactive()` | 接口失效即切换成功 |
+| 重试 | 每个配置一次，失败靠用户重插 | 3 次快重试 + 30s 慢重试 | 核内常驻，可以比用户态更主动，但绝不刷屏 |
+| 绑定 modem 接口 | `option` 绑 `ff/01/01`、`ff/01/02` | 不碰（`bInterfaceClass == 8` 才处理） | 见 option.c:684-685 |
+| 复位后重切 | `usb_reset_resume` → 重跑模式切换 | 常驻线程发现 1505 就再切 | 拔插必回 1505，所以必须常驻 |
+| 电源管理 | `USB_QUIRK_*` / autosuspend 关闭 | 不做：PPP 有流量，设备不会空闲挂起 | 需要时再补 |
 
 ### 为什么必须另起线程
 
@@ -130,16 +200,38 @@ USB workloop。workloop 一旦被复位流程占住，我们的线程就永久�
 `commandSleep` 等 workloop 处理 —— **自己等自己，必死锁**。
 内核线程不占 workloop，同步调用才安全。
 
-### 为什么 setTimeout 从 30 轮改为永久
+### 为什么从 30 秒窗口改成永久监视
 
 1.4.0 的线程只跑 30 轮（约 30 秒）就退出，理由是"开机时切一次就够了"。
 但实测：**模式不存在固件里**，USB 断电就丢 —— 物理拔插后设备必回 `1505`，
 重启反而不会（USB 没断电）。所以 30 秒窗口根本不够，v1.5.0 改成永久监视。
 
-### 异步 `pipe->io()` 而不是同步
+### 诊断计数发布到 IORegistry
 
-同理：`start()` 上下文不能阻塞。完成回调只 `IOLog`，不碰成员变量，
-避免晚于 `stop()` 触发"释放后使用"。
+每次心跳会把计数写进 `E398Loader` 的属性，排查时不必只靠翻日志：
+
+```bash
+ioreg -r -n E398Loader -w0 | grep E398
+# "E398ActiveSwitchers"=1  "E398Attempts"=1  "E398Timeouts"=0  "E398LastStatus"=0
+```
+
+`E398ActiveSwitchers = 1` 说明 personality 已经接管；一直是 0 说明它在输，走的是兜底路径。
+
+### 关于那 88 条编译告警（1.7.0 起为 0）
+
+| 条数 | 告警 | 来源 | 处理 |
+|---|---|---|---|
+| 70 | `-Winconsistent-missing-override` | **SDK 头文件**（`IOUSBHostIOSource.h`、`IOUSBHostStream.h`、`IOUSBHostPipe.h`）：这些类里一部分虚函数标了 `override`、另一部分没标，clang 就对没标的那些报 | 编译加 `-Wno-inconsistent-missing-override`。不是我们的代码，改不了也不该改 |
+| 18 | `-Wdeprecated-declarations` | **我们的代码**：`IOUSBHostInterface` / `IOUSBHostPipe` 自 10.15 起标为 deprecated（"Use USBDriverKit"） | 源码里 `#pragma clang diagnostic ignored "-Wdeprecated-declarations"` 局部屏蔽 |
+
+**为什么不用 DriverKit 换掉这套 API**：DriverKit 的 USB 驱动需要 Apple 签发的
+entitlement（`com.apple.developer.driverkit.transport.usb`）+ provisioning profile，
+必须走开发者账号申请；本地 ad-hoc 签名的 kext 拿不到。而 kext 里的
+`IOUSBHostInterface` 在 Intel + SIP 关闭 + AuxKC 的环境下仍然完全可用 ——
+所以这里是"接受弃用"而不是"必须迁移"。
+
+处理之后同时开了 `-Wall -Wextra`，**0 条告警**；构建脚本会把告警数打出来，
+以后再冒出新的（比如类型不匹配、未使用变量）会立刻看见。
 
 版本演进：
 
@@ -147,9 +239,11 @@ USB workloop。workloop 一旦被复位流程占住，我们的线程就永久�
 |---|---|---|
 | 1.2.0 | 首版，`KMOD_EXPLICIT_DECL(..., 0, 0)` | 内核 `NULL module start pointer` |
 | 1.3.0 | start/stop 换成真函数 | kmod 层终于通过 |
-| 1.4.0 | 放弃抢 personality，改 IOResources + 内核线程 | 1000000 分仍抢不过 50000 |
+| 1.4.0 | 放弃抢 personality，改 IOResources + 内核线程 | 1000000 分仍抢不过 50000（kext 还没进内核） |
 | 1.5.0 | 永久监视 + `kIOServiceSeize` 优先、terminate 兜底 | 拔插后无人切换 |
 | 1.6.0 | 去掉"发满 6 次就放弃"、发完放开接口、异步 terminate、60 秒心跳 | 断联后永久停在 1505 且无日志 |
+| 1.7.0 | 两条路径互斥、修 `stop()` 的 UAF、无条件 `close()`（修掉 `busy 1` 卡 17 天的对象泄漏）、报文快慢两级退避、传输内存所有权；编译 0 warning | 长期使用后仍会断联；`ioreg` 里抓到未释放的 1505 接口对象 |
+
 
 ---
 
@@ -324,7 +418,7 @@ xray 自己去连节点、自己去查 DNS 的流量，也会被 TUN 抓走 → 
 
 ---
 
-## 10. 与 Linux 的 E398 驱动对照
+## 10. 与 Linux 拨号流程的对照（模式切换见 §4）
 
 Linux 下（`usb_modeswitch` + `option` 驱动）能跑的，这里逐条对应：
 
