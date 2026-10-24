@@ -18,6 +18,32 @@
  *          所以 30 秒窗口根本不够 —— 改成永久监视，任何时刻插上都自动切换。
  *          另外接口被占用时先试 kIOServiceSeize（让 IOService 自己把占用者撤下），
  *          失败再 terminate 那个 MassStorage 子服务，两条路都记日志。
+ *   1.6.0  长期使用后「经常性断联、断了就再也切不上去」的修法。1.5.0 有三个硬伤：
+ *
+ *          (a) 【永久放弃，且不留痕迹】
+ *              e398HandleInterface 开头 `if (sendCount >= E398_MAX_SEND) return false;`，
+ *              而 sendCount 只在「换了接口对象」和「看不见 1505」两个分支里清零。
+ *              设备只要一直停在 1505，这两个分支就永远不执行 —— 于是发满 6 次报文后
+ *              这个设备实例被永久放弃，连一行日志都不再打。表现就是
+ *              「5-ppp-dial 说 25 秒没切到 1506」+「7-verify 看不到任何切换日志」。
+ *              → 1.6.0 删掉 MAX_SEND 这个终态，改成「发一轮 → 放掉接口 → 再抢再发」的
+ *                无限循环，不存在"放弃"这个状态。
+ *
+ *          (b) 【长期占着接口，把重枚举堵住】
+ *              报文发出后一直 hold 着 IOUSBHostInterface。设备切模式必定伴随 USB
+ *              复位/重枚举，而接口会话被我们占着，macOS 撤不掉，切换就卡在半路。
+ *              → 改成「发完按住 3 秒（等异步传输收尾），然后 close() 放手」，
+ *                让设备能顺利完成重枚举。
+ *
+ *          (c) 【在内核线程里同步 terminate】
+ *              terminate(kIOServiceSynchronous) 会阻塞等待被终止服务真的停下来，
+ *              而这个等待依赖 USB workloop。workloop 一旦被复位流程占住，
+ *              我们的线程就永久挂在那里 —— 线程死了，从此没有任何人重试。
+ *              → 改成异步 terminate()，本轮返回、下一轮再检查，绝不阻塞。
+ *
+ *          另外补了 60 秒心跳日志。以前"没有日志"无法区分「没事发生」和「线程死了」，
+ *          这次排查就卡在这个歧义上：心跳里同时报出 看到1505/持有接口/累计尝试次数，
+ *          一眼就能看出线程是活的但切不动，还是根本没在跑。
  *
  * 为什么要另起线程，而不是在 start() 里直接做：
  *   start() 跑在 USB 的 workloop 上，IOUSBHostInterface::open() 会 commandSleep
@@ -63,7 +89,7 @@ extern "C" kern_return_t E398KmodStop(kmod_info_t *ki, void *data)
 }
 
 extern "C" {
-KMOD_EXPLICIT_DECL(E398Switcher, "1.5.0", E398KmodStart, E398KmodStop);
+KMOD_EXPLICIT_DECL(E398Switcher, "1.6.0", E398KmodStart, E398KmodStop);
 }
 
 /* usb_modeswitch.d/12d1:1505 的 MessageContent，逐字节一致，共 31 字节。
@@ -81,7 +107,12 @@ static const UInt8 kE398SwitchPacket[31] = {
 };
 
 #define E398_IO_TIMEOUT_MS 2000
-#define E398_MAX_SEND      6      /* 同一个接口最多重发几次报文 */
+/* 报文发出后按住接口的轮数（1 轮 ≈ 1 秒）。
+ * 必须 > E398_IO_TIMEOUT_MS，让异步传输自己收尾；但不能太久 ——
+ * 设备要重枚举，接口被占着就切不动。3 轮是实测的折中值。 */
+#define E398_HOLD_ROUNDS   3
+/* 心跳间隔：没有这条日志时，"没有日志"分不清「没事发生」和「线程死了」 */
+#define E398_HEARTBEAT_S   60
 
 /* 内核里不保证有 strstr（stdlib 的 string.h 在 KERNEL 下只给一部分），
  * 自己写一个子串判断，避免链接期缺符号。 */
@@ -217,7 +248,8 @@ struct E398State {
     IOService           *client;       /* open/close 用谁的名义（驱动自己） */
     bool                 seizeTried;   /* 是否试过 kIOServiceSeize */
     bool                 killTried;    /* 是否 terminate 过占用者 */
-    int                  sendCount;    /* 已提交报文次数 */
+    int                  holdRounds;   /* 报文发出后按住接口的轮数 */
+    int                  attempts;     /* 累计下发的报文数（只用于日志降噪） */
     int                  openFails;    /* open 连续失败次数（用于降噪日志） */
     IOUSBHostInterface  *held;         /* 已 open 且 retain 的接口 */
 };
@@ -255,31 +287,69 @@ static IOService *e398FindBlocker(IOUSBHostInterface *intf)
     return found;
 }
 
-/* 返回 true 表示报文已经提交出去了 */
+/* 放掉当前持有的接口。
+ * 注意 inactive 的对象绝不能 close()：close 要等一条永远不回来的 USB 消息，
+ * 会把内核线程永久挂在这里（这正是 1.5.0「线程像死了」的另一条路径）。 */
+static void e398ReleaseHeld(E398State *st, const char *why)
+{
+    if (!st->held) {
+        return;
+    }
+    IOUSBHostInterface *h = st->held;
+    st->held       = NULL;
+    st->holdRounds = 0;
+    st->seizeTried = false;
+    st->killTried  = false;
+    if (!h->isInactive()) {
+        h->close(st->client);
+    }
+    h->release();
+    if (why) {
+        IOLog("E398Switcher: 释放接口（%s）\n", why);
+    }
+}
+
+/* 抢到接口后立刻发报文，统一入口（三条路径共用一套计数与日志） */
+static bool e398TakeAndSend(IOUSBHostInterface *intf, E398State *st, const char *how)
+{
+    st->held = intf;
+    intf->retain();
+    st->holdRounds = 0;
+    st->attempts++;
+    IOReturn kr = e398SendSwitch(intf);
+    /* 前 5 次全记（排查要看首轮的结果），之后每 10 次记一条。
+     * 不做限流的话，设备一直切不过去时每 5 秒一条，几小时就把内核日志刷满。 */
+    if (st->attempts <= 5 || st->attempts % 10 == 0) {
+        IOLog("E398Switcher: 第 %d 次下发 31 字节切换报文（%s）-> 0x%08x\n",
+              st->attempts, how, kr);
+    }
+    return (kr == kIOReturnSuccess);
+}
+
+/* 返回 true 表示这一轮刚刚把报文提交出去了 */
 static bool e398HandleInterface(IOUSBHostInterface *intf, E398State *st)
 {
-    /* 已经持有这个接口：只在还没发够次数时重发 */
+    /* 设备重枚举后，之前 retain 的接口对象会变成 inactive。
+       它是"上一代的尸体"，必须先丢掉，否则 holdRounds 永远挂在这个死对象上。 */
+    if (st->held && st->held->isInactive()) {
+        e398ReleaseHeld(st, "上一代接口已失效，设备重枚举过");
+    }
+
+    /* 1) 报文刚发出去：按住几轮等异步传输收尾，然后立刻放手。
+          1.5.0 是一直占着不放，设备的重枚举被这个会话堵住，切换就卡在半路。 */
     if (st->held == intf) {
-        if (st->sendCount >= E398_MAX_SEND) {
+        if (++st->holdRounds < E398_HOLD_ROUNDS) {
             return false;
         }
-        st->sendCount++;
-        IOReturn kr = e398SendSwitch(intf);
-        IOLog("E398Switcher: 重发报文 #%d -> 0x%08x\n", st->sendCount, kr);
-        return (kr == kIOReturnSuccess);
+        e398ReleaseHeld(st, NULL);
+        if (st->attempts % 10 == 0) {
+            IOLog("E398Switcher: 已发 %d 次报文仍是 1505，放开接口准备再来\n",
+                  st->attempts);
+        }
+        return false;
     }
 
-    /* 换了一个接口对象：把旧的放掉 */
-    if (st->held) {
-        st->held->close(st->client);
-        st->held->release();
-        st->held = NULL;
-        st->seizeTried = false;
-        st->killTried  = false;
-        st->sendCount  = 0;
-        st->openFails  = 0;
-    }
-
+    /* 2) 没有持有接口：先看有没有占用者 */
     OSString *owner = OSDynamicCast(OSString, intf->getProperty("UsbExclusiveOwner"));
 
     if (owner) {
@@ -289,12 +359,7 @@ static bool e398HandleInterface(IOUSBHostInterface *intf, E398State *st)
             if (intf->open(st->client, kIOServiceSeize, NULL)) {
                 IOLog("E398Switcher: kIOServiceSeize 成功，已从 %s 手里接管接口\n",
                       owner->getCStringNoCopy());
-                st->held = intf;
-                intf->retain();
-                st->sendCount = 1;
-                IOReturn kr = e398SendSwitch(intf);
-                IOLog("E398Switcher: 已独占接口，下发 31 字节切换报文 -> 0x%08x\n", kr);
-                return (kr == kIOReturnSuccess);
+                return e398TakeAndSend(intf, st, "seize 接管");
             }
             IOLog("E398Switcher: kIOServiceSeize 失败（占用者 %s 不让）\n",
                   owner->getCStringNoCopy());
@@ -306,8 +371,13 @@ static bool e398HandleInterface(IOUSBHostInterface *intf, E398State *st)
             IOService *blocker = e398FindBlocker(intf);
             if (blocker) {
                 const char *cls = blocker->getMetaClass()->getClassName();
-                IOLog("E398Switcher: 终止占用者 %s 以释放接口\n", cls ? cls : "?");
-                blocker->terminate(kIOServiceSynchronous);
+                IOLog("E398Switcher: 终止占用者 %s 以释放接口（异步，不等它停）\n",
+                      cls ? cls : "?");
+                /* ⚠ 1.5.0 用的是 terminate(kIOServiceSynchronous)：它会阻塞到被终止的
+                   服务真的停下来，而那个过程依赖 USB workloop。workloop 一旦被复位
+                   流程占住，我们的线程就永久挂死，从此没人再重试（断联后再也切不上
+                   去的直接原因之一）。这里改成异步，本轮返回、下一轮再检查。 */
+                blocker->terminate(0);
                 blocker->release();
             } else {
                 IOLog("E398Switcher: 属性说有占用者，但子节点里没找到 MassStorage 服务\n");
@@ -316,31 +386,21 @@ static bool e398HandleInterface(IOUSBHostInterface *intf, E398State *st)
         return false;   /* 下一轮再看占用是否解除 */
     }
 
-    /* 接口空闲：直接 open */
+    /* 3) 接口空闲：直接 open */
     if (intf->open(st->client, 0, NULL)) {
-        IOLog("E398Switcher: 已独占接口（原本空闲），下发 31 字节切换报文\n");
-        st->held = intf;
-        intf->retain();
-        st->sendCount = 1;
-        IOReturn kr = e398SendSwitch(intf);
-        IOLog("E398Switcher: 报文提交结果 0x%08x\n", kr);
-        return (kr == kIOReturnSuccess);
+        st->openFails = 0;
+        return e398TakeAndSend(intf, st, "接口空闲");
     }
 
-    /* 兜底再来一次 seize */
-    if (intf->open(st->client, kIOServiceSeize, NULL)) {
-        IOLog("E398Switcher: seize 兜底成功\n");
-        st->held = intf;
-        intf->retain();
-        st->sendCount = 1;
-        IOReturn kr = e398SendSwitch(intf);
-        IOLog("E398Switcher: 报文提交结果 0x%08x\n", kr);
-        return (kr == kIOReturnSuccess);
+    /* 兜底再来一次 seize：属性里没有占用者，不代表真没人占（时序问题） */
+    if (!st->seizeTried && intf->open(st->client, kIOServiceSeize, NULL)) {
+        st->seizeTried = true;
+        IOLog("E398Switcher: 没看到占用者属性，但 seize 拿到了接口\n");
+        return e398TakeAndSend(intf, st, "seize 兜底");
     }
 
-    if (++st->openFails <= 3) {
-        IOLog("E398Switcher: 接口没有占用者属性，但 open 仍然失败（第 %d 次）\n",
-              st->openFails);
+    if (++st->openFails <= 3 || st->openFails % 30 == 0) {
+        IOLog("E398Switcher: open 失败（第 %d 次），下一轮再试\n", st->openFails);
     }
     return false;
 }
@@ -530,7 +590,8 @@ void E398Loader::threadMain(void *arg, wait_result_t waitResult)
 
 void E398Loader::run(void)
 {
-    int sec = 0;
+    int sec       = 0;
+    int lastFound = -1;   /* -1 = 还没扫过；用来抓「1505 重新出现」这个边沿 */
 
     for (;;) {
         IOSleep(1000);
@@ -539,8 +600,24 @@ void E398Loader::run(void)
         }
         sec++;
 
+        /* 心跳：这一行是判断「线程活着但切不动」还是「线程根本没在跑」的唯一依据。
+         * 1.5.0 没有它，所以这次排查只能在"没日志"上瞎猜。 */
+        if (sec % E398_HEARTBEAT_S == 0) {
+            IOLog("E398Switcher: 心跳 %ds —— 上一轮看到 1505 接口 %d 个，"
+                  "持有接口 %d，累计发报文 %d 次\n",
+                  sec, lastFound < 0 ? 0 : lastFound,
+                  fState.held ? 1 : 0, fState.attempts);
+        }
+
         int found = 0;
         bool submitted = e398OneRound(&fState, &found);
+
+        /* 边沿记录：1505 重新出现 = 设备刚经历过一次 USB 复位/重插。
+         * 这条日志直接对得上「断联」的时间点，排查时先找它。 */
+        if (found > 0 && lastFound <= 0) {
+            IOLog("E398Switcher: 检测到 12d1:1505（设备刚复位或刚插入），开始切换\n");
+        }
+        lastFound = found;
 
         if (submitted) {
             IOLog("E398Switcher: 第 %d 秒已下发切换报文，等待设备重枚举\n", sec);
@@ -548,25 +625,23 @@ void E398Loader::run(void)
         }
 
         if (found > 0) {
-            /* 看到 1505 但还没切成功：每秒都在处理，日志由 handleInterface 打 */
+            /* 看到 1505 但这一轮还没发报文（正在按住接口 / 正在抢）：
+             * 计数与日志由 e398HandleInterface 负责，这里只保证不停地转。 */
             continue;
         }
 
         /* 没有 1505 了：设备要么已经是 1506，要么还没插。
-         * 这时把之前持有的接口放掉，为下一次拔插做准备。 */
+         * 这时把之前持有的接口放掉，为下一次拔插/重枚举做准备。 */
         if (fState.held) {
-            fState.held->close(fState.client);
-            fState.held->release();
-            fState.held        = NULL;
-            fState.seizeTried  = false;
-            fState.killTried   = false;
-            fState.sendCount   = 0;
-            fState.openFails   = 0;
+            e398ReleaseHeld(&fState, "已看不到 1505（设备已切走或已拔出）");
+            fState.openFails = 0;
+            fState.attempts  = 0;
         }
 
         if (sec % 300 == 0) {
             IOLog("E398Switcher: 监视中（已运行 %d 秒，当前没有 12d1:1505）\n", sec);
         }
     }
+    e398ReleaseHeld(&fState, "监视线程退出");
     IOLog("E398Switcher: 监视线程退出\n");
 }

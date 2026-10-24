@@ -225,10 +225,24 @@ if ! is_pid 5382; then
   if ! is_pid 5381; then
     echo "    连 1505 都看不到：modem 没插好"
   else
-    echo "    还停在 1505，说明监视线程没生效。检查："
-    echo "      kmutil showloaded | grep e398     （版本必须是 1.5.0）"
-    echo "      ./7-verify.sh                      （第 2 节看 'kIOServiceSeize 成功' 或 '终止占用者'）"
-    echo "    如果是 1.4.0 或更早：sudo ./6-install-switcher.sh 然后重启"
+    echo "    还停在 1505（零CD）—— kext 的监视线程没把切换做完。"
+    echo
+    # 现场证据：接口被谁占着。
+    # 1.5.0 的已知 bug 就是这个值一直是 E398Loader：报文发满 6 次后永久放弃，
+    # 而且接口一直不放手，所以设备再也不可能切过去（日志也一个字不再打）。
+    OWN=$(ioreg -w0 -r -c IOUSBHostInterface -l 2>/dev/null \
+          | grep -A40 '"USB Product Name" = "HUAWEI Mobile"' \
+          | grep -m1 '"UsbExclusiveOwner"')
+    [ -n "$OWN" ] && echo "    接口独占者：$OWN"
+    echo "    kext 版本：  $(kmutil showloaded --list-only 2>/dev/null | grep -o 'local.e398.switcher ([0-9.]*)' | head -1)"
+    echo
+    echo "    判据："
+    echo "     · 独占者是 E398Loader 且一直不变 → 1.5.0 的 bug（发满 6 次就永久放弃 + 占着不放）"
+    echo -e "       升级：${G}./build-kext.sh && sudo ./6-install-switcher.sh${N} 然后重启"
+    echo "     · 没有独占者、7-verify 第 2 节也没有心跳 → 监视线程根本没在跑"
+    echo "     · 报文返回 0xe00002xx → 发不出去，把 ./7-verify.sh 的完整输出发我"
+    echo
+    echo "    临时救急：拔插 modem（5 秒）让它以新对象重新枚举，旧版也能恢复一次。"
   fi
   exit 2
 fi

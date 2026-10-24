@@ -49,6 +49,23 @@ sudo ./8-ppp-keepalive.sh stop --down   # 停看护并断开
 
 看护每 15 秒查一次 `ppp0`，日志在 `/tmp/e398-keepalive.log`。
 
+### 断了想知道"为什么断"
+
+看护只负责重拨，不告诉你原因。要查原因得在断的当下取证：
+
+```bash
+sudo ./15-watch.sh start      # 常驻（3 秒一次采样，开销很小）
+./15-watch.sh status          # 采样了多少轮 / 记录了几次事件
+./15-watch.sh show            # 每次事件的现场：PID 变化 + pppd 日志 + USB 日志
+./15-watch.sh show 1          # 只看最近一次
+sudo ./15-watch.sh stop
+```
+
+它记录三样东西：`ppp0` 地址、设备 PID（`1506 → 1505` 说明 USB 被复位了，
+不是单纯掉线）、USB 层内核事件。产物在 `/tmp/e398-watch/`。
+
+怎么读结果 → [排错 · 经常性断联](03-troubleshooting.md)。
+
 ---
 
 ## 2. 状态怎么读

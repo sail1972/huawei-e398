@@ -85,7 +85,7 @@ sudo ./6-install-switcher.sh
 | 1 | 编译 / 校验 `E398Switcher.kext` | 必须看到 `二进制含 _kmod_info`，且 start 指针非 0 |
 | 2 | 拷进 `/Library/Extensions`（root:wheel） | 目录属主必须是 `root wheel` |
 | 2.5 | 检查 AMFI | 必须是"已关闭"，否则只警告不拦你 |
-| 3 | 重建 AuxKC（`kmutil install -z` → 失败换依赖写法） | `AuxKC 里已有 local.e398.switcher 1.5.0` |
+| 3 | 重建 AuxKC（`kmutil install -z` → 失败换依赖写法） | `AuxKC 里已有 local.e398.switcher 1.6.0` |
 | 4 | 自检 | — |
 | 5 | 尝试立即加载 | 首次通常要重启，属正常 |
 | 6 | 提示重启 | 回答 `y` 自动重启 |
@@ -109,7 +109,7 @@ sudo ./6-install-switcher.sh
 
 | 节 | 正常表现 | 不正常时 |
 |---|---|---|
-| 1. 内核扩展是否加载 | `showloaded` 里有 `local.e398.switcher (1.5.0)` **且** `E398Loader 实例：有` | 只有 showloaded 没有实例 → kmod start 失败，看第 2 节日志 |
+| 1. 内核扩展是否加载 | `showloaded` 里有 `local.e398.switcher (1.6.0)` **且** `E398Loader 实例：有` | 只有 showloaded 没有实例 → kmod start 失败，看第 2 节日志 |
 | 2. 内核日志 | 有 `E398Switcher: 已发送切换报文` 之类的行 | 出现 `NULL module start pointer` / `0xdc008007` → kext 被内核回滚 |
 | 3. 设备 PID | `12d1:1506` | 还是 1505 → 见 [troubleshooting](03-troubleshooting.md) |
 | 4. 接口归谁 | `UsbExclusiveOwner` 是 E398 相关 | 被 `IOUSBMassStorageDriver` 占着 → 拔插一次重来 |
@@ -212,7 +212,7 @@ sudo ./12-amfi.sh off     # 撤销 AMFI 放宽，重启生效
 ```
 $ ./7-verify.sh
 === 1. 内核扩展是否加载 ===
-  151    0 0xffffff7f970da000 ...  local.e398.switcher (1.5.0)
+  151    0 0xffffff7f970da000 ...  local.e398.switcher (1.6.0)
       E398Loader 实例：有（kmod 层通过）
 === 3. 设备当前 PID ===
   12d1:1506 在

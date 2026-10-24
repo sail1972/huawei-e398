@@ -12,6 +12,58 @@ sudo ./10-diag.sh      # 兜底：落一份 diag-*.log，可直接贴出来
 
 ---
 
+## 用一段时间就断，断了再也回不到 1506
+
+这是本项目最难受的一类问题：断联本身有很多种原因，但**现象完全一样**（ppp0 没了），
+事后再查只能看到"没有 ppp0"，什么都对不上。所以第一步不是猜，是**在断的当下取证**。
+
+```bash
+sudo ./15-watch.sh start     # 常驻，开销很小（3 秒一次采样）
+# ……正常用，等它断……
+./15-watch.sh show           # 直接把断联那一刻的三份现场打出来
+```
+
+`show` 每条事件里同时给了：ppp0 之前/之后的地址、设备 PID 变化、pppd 日志末尾、
+USB 内核日志末尾。按下面的表对号入座：
+
+| 事件里看到的 | 根因 | 怎么办 |
+|---|---|---|
+| `设备 PID 变化：1506 → 1505` | **USB 复位/重枚举**。设备掉电重来，模式丢了 | 属于硬件层，见下面"USB 复位为什么发生" |
+| `设备 PID 变化：1506 → -` 然后 `- → 1506` | 设备整只消失再回来，通常是**供电不足/接触不良** | 换 USB 口（别用 hub、别用延长线）、换线；优先插机身直连口 |
+| PID 一直是 1506，只是 `ppp0 消失` | 不是 USB 问题，是 **PPP 会话被拆** | 看 pppd 日志：`LCP: timeout sending Config-Requests` = 对端/运营商拆了 PDP；`NO CARRIER` = 网络侧拒绝 |
+| USB 日志里有 `port reset` / `not responding` / `over-current` | 端口复位、设备不响应、**超电流** | 超电流只能换口/换线；`not responding` 多为固件卡死，拔插 |
+| 什么都没抓到 | 采样间隔（3 秒）太长，或 log stream 没权限 | 用 `sudo` 跑；确认 `./15-watch.sh status` 里 USB 日志是"采集正常" |
+
+### USB 复位为什么发生（按可能性排序）
+
+1. **供电**。E398 是老设备，发射瞬间电流冲高；T2 机身的 USB-A 口、
+   尤其是经过 hub / 延长线 / 前面板时，掉压就会触发端口复位。
+   **这条最常见，也最容易验证**：换一个口、去掉一切转接，观察断联频率是否变化。
+2. **线材**。只有充电线芯的劣质线在高速 bulk 传输下误码率高，主机侧会复位端口。
+3. **modem 固件自己重启**。E398 固件遇到异常 AT / 异常 PPP 帧会复位自己，
+   复位后就是 1505（模式不在固件里，USB 一断就丢）。
+4. **`--down` 之后立刻重拨**。此时 PDP 还没拆，属于已知行为，见下面 `if0 不响应 AT`。
+
+### 断联之后为什么有时切不回 1506
+
+kext 1.5.0 有一个确定的缺陷：报文发满 6 次后 `sendCount` 不再清零，
+而清零只发生在"换接口对象"和"看不见 1505"两个分支里 —— 设备一直停在 1505 时
+这两个分支都不会执行，于是**永久放弃重试，并且不再打任何日志**。
+同时它还一直 `open()` 着接口不放手（`ioreg` 里能看到
+`"UsbExclusiveOwner" = "E398Loader"`），把设备的重枚举也堵住了。
+
+1.6.0 改成"发一轮 → 放开接口 → 下一轮再抢再发"的无限循环，并加了 60 秒心跳：
+
+```bash
+kmutil showloaded | grep e398            # 版本必须是 1.6.0
+# 有「心跳 Ns」= 线程活着；有「检测到 12d1:1505（设备刚复位或刚插入）」= 抓到复位时刻
+log show --last 30m --predicate 'eventMessage CONTAINS "E398Switcher"' | tail -20
+```
+
+判断"线程是活着但切不动"还是"线程根本没跑"，就看有没有心跳（1.6.0 每 60 秒一条）。
+
+---
+
 ## `7-verify.sh` 里还是 1505
 
 先分清是"kext 没加载"还是"加载了但没抢到接口"。
@@ -26,18 +78,24 @@ ioreg -p IOUSB -w0 -l | grep -A2 UsbExclusiveOwner
 |---|---|---|
 | `showloaded` 里没有 e398 | kext 根本没进内核 | 见下一节 |
 | `showloaded` 有，但 `E398Loader` 计数为 0 | **假加载**：kmod start 失败被回滚 | 见下一节（`0xdc008007`） |
-| 两者都有，但设备仍 1505 | 线程没抢到接口 | 拔插一次 modem；仍不行看内核日志里的 `open ... 失败` |
-| `UsbExclusiveOwner` 是 `IOUSBMassStorageDriver` | 占用者没被赶走 | 拔插；v1.5.0 会先 `open(kIOServiceSeize)` 再 `terminate` |
+| `UsbExclusiveOwner` 是 `E398Loader` 且一直不变 | 1.5.0 的 bug：发满 6 次就永久放弃 + 占着接口不放 | 升级到 1.6.0（`./build-kext.sh && sudo ./6-install-switcher.sh`，重启） |
+| `UsbExclusiveOwner` 是 `IOUSBMassStorageDriver` | 占用者没被赶走 | 拔插；1.6.0 会先 `open(kIOServiceSeize)` 再异步 `terminate` |
+| 两者都有，但设备仍 1505 | 线程没抢到接口 | 拔插一次 modem；仍不行看内核日志里的 `open 失败` 与报文返回码 |
 
-查看它到底做了什么：
+查看它到底做了什么（`--last boot` 会扫本次开机全部日志，很慢；先看最近 30 分钟）：
 
 ```bash
-log show --last boot --predicate 'eventMessage CONTAINS "E398"' | tail -30
+log show --last 30m --predicate 'eventMessage CONTAINS "E398Switcher"' | tail -30
 ```
 
-正常会看到类似 `E398Switcher: 找到 12d1:1505 接口` → `已发送切换报文`。
+正常会看到 `检测到 12d1:1505` → `第 N 次下发 31 字节切换报文（...） -> 0x0`。
 
 拔插是对的：USB 重枚举后 kext 会重新匹配一次，此时它已在内核里，一定赢。
+
+> **`7-verify.sh` 以前会"卡死"**，原因不是内核死锁：它内部用
+> `log show --last boot --predicate 'eventMessage CONTAINS ...'`，`CONTAINS` 用不上索引，
+> 等于把本次开机以来每条日志读一遍，开机一两天就是几十秒到几分钟；而且非 root 拿到空
+> 之后还会再跑一遍 `sudo -n`，翻倍。现在每一步都有超时并打印耗时，不会再无声卡住。
 
 ---
 
@@ -74,7 +132,7 @@ log show --last boot --predicate 'eventMessage CONTAINS "E398"' | tail -30
 ```cpp
 extern "C" kern_return_t E398KmodStart(kmod_info_t *ki, void *d);
 extern "C" kern_return_t E398KmodStop(kmod_info_t *ki, void *d);
-KMOD_EXPLICIT_DECL(E398Switcher, "1.5.0", E398KmodStart, E398KmodStop)
+KMOD_EXPLICIT_DECL(E398Switcher, "1.6.0", E398KmodStart, E398KmodStop)
 ```
 
 自检（不用装，直接看二进制）：

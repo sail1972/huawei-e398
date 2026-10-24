@@ -83,6 +83,10 @@ sudo ./14-tun.sh down
 
 # 看护
 sudo ./8-ppp-keepalive.sh start   # ppp0 掉线自动重拨（stop / status）
+
+# 断联取证（怀疑"用一会儿就断"时先开它）
+sudo ./15-watch.sh start          # 常驻记录 USB 事件 + 断联瞬间现场
+./15-watch.sh show                # 断过之后看这里，直接给原因线索
 ```
 
 `--down` 之后**立刻**再拨也能连上：脚本发现 if0 上还在流 PPP 帧，就走"复用旧会话"路径，
@@ -115,17 +119,23 @@ sudo ./8-ppp-keepalive.sh start   # ppp0 掉线自动重拨（stop / status）
 ## 已知限制
 
 - **模式切换不持久**：USB 不断电就还是 1506；**物理拔插必回 1505**，
-  但开机后 kext 会自己再切一次（1~3 秒）。重启不影响。
+  但 kext 会自己再切一次（1~3 秒）。重启不影响。
+  kext 的监视线程是**永久**运行的，且 1.6.0 起不会再"放弃重试"：
+  发一轮报文 → 放开接口 → 下一轮再抢再发，每 60 秒打一条心跳日志。
+  （1.5.0 发满 6 次报文后会永久放弃且不再打日志，断联后表现就是"一直停在 1505"。）
 - **`--down` 断不干净**：`ATD` 之后 if0 变成纯数据管道，modem 固件不解析 AT。
   `+++`/`ATH`/重枚举/`SetConfiguration(0→1)`/USB 挂起全部实测无效，
   只有**拔插断电**真的拆 PDP。脚本用"复用旧会话"绕过。
 - **只有一个 IPv4 地址**，没有 IPv6；MTU 1500 实测可用。
 - **系统代理对 ppp0 无效**（macOS 15 的 CFNetwork 行为），所以代理必须走 TUN。
+- **长连接会断**，原因不止一种（USB 被复位 / modem 自己重启 / 运营商拆 PDP）。
+  这三者的现象都是"ppp0 没了"，事后无法区分 —— 用 `15-watch.sh` 在断的当下取证。
 
 ## 出问题了
 
 | 症状 | 先看 |
 |---|---|
+| 用一段时间就断，断了停在 1505 | [排错 · 经常性断联](docs/03-troubleshooting.md) —— 先 `sudo ./15-watch.sh start` |
 | `7-verify.sh` 里还是 1505 | [排错 · 还是 1505](docs/03-troubleshooting.md) |
 | kext 在 AuxKC 里但没加载（Code 28 / 71 / `0xdc008007`） | [排错 · kext 不生效](docs/03-troubleshooting.md) |
 | `✗ if0 不响应 AT` | [排错 · if0 不响应 AT](docs/03-troubleshooting.md) |
@@ -157,6 +167,7 @@ huawei-e398/
 ├── 7-verify.sh             重启后体检：设备 PID / kext / 服务实例 / 串口
 ├── 5-ppp-dial.sh           拨号主程序（--fg / --down / --status / --recover）
 ├── 8-ppp-keepalive.sh      掉线自动重拨
+├── 15-watch.sh             断联取证：常驻记录 USB 事件 + 断联瞬间现场
 ├── 14-tun.sh               全局代理（sing-box TUN）
 ├── 11-proxy-fix.sh         系统代理写入（ppp0 上无效，留作证据）
 ├── 13-proxy-diag.sh        三步实验，证明 macOS 15 不给 ppp0 用系统代理

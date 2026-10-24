@@ -57,7 +57,7 @@
 
 ---
 
-## 4. kext 的设计（v1.5.0）
+## 4. kext 的设计（v1.6.0）
 
 ### 为什么不是"注册一个高分 personality 就完事"
 
@@ -78,10 +78,51 @@ E398Loader: IOProviderClass = IOResources, IOClass = E398Loader
 ```
 找到 12d1:1505 的接口
   ├─ 先试 intf->open(client, kIOServiceSeize, NULL)      ← 让 IOService 把占用者撤下
-  ├─ 失败则找子节点类名含 "MassStorage" 的服务，terminate(kIOServiceSynchronous)
+  ├─ 失败则找子节点类名含 "MassStorage" 的服务，terminate() 异步终止
   ├─ 仍无占用者 → 异步 pipe->io() 写 31 字节
-  └─ 每 300 秒打一次心跳
+  ├─ 按住接口 3 秒（等异步传输收尾）→ close() 放手 → 下一轮重新抢
+  └─ 每 60 秒打一次心跳（看到几个 1505 / 是否持有接口 / 累计发报文次数）
 ```
+
+### 1.5.0 的三个硬伤（1.6.0 全部修掉）
+
+长期使用后出现「经常断、断了就再也切不上去、而且没有任何日志」，逐行读代码后定位到三处：
+
+**① 永久放弃，且不留痕迹（最致命）**
+
+```cpp
+if (st->held == intf) {
+    if (st->sendCount >= E398_MAX_SEND) return false;   // ← 6 次之后永远走这里
+    st->sendCount++;
+    ...
+}
+```
+
+`sendCount` 只在两个地方清零：换接口对象时、以及"看不见 1505"时。而设备**一直停在
+1505** 的时候，这两个分支都不会执行 —— 于是发满 6 次后这个设备实例被永久放弃，
+`IOLog` 一行都不再打。表现就是 `5-ppp-dial.sh` 喊"25 秒没切到 1506"、
+`7-verify.sh` 第 2 节什么日志都没有，看起来像线程死了，其实是它在空转。
+
+现场证据（`ioreg`）：
+
+```
+"UsbExclusiveOwner" = "E398Loader"      ← 它自己占着接口，永远不放
+```
+
+**② 长期占着接口，把重枚举堵住**
+
+报文发出后一直 hold 着 `IOUSBHostInterface`。而切换模式必定伴随 USB 复位/重枚举，
+接口会话被我们占着，macOS 撤不掉，切换就卡在半路。
+1.6.0 改成：发完按住 3 轮（> 2 秒的 IO 超时，让异步传输收尾）→ `close()` → 下一轮重新抢。
+
+**③ 在内核线程里同步 terminate**
+
+`terminate(kIOServiceSynchronous)` 会阻塞到被终止的服务真的停下来，而这个等待依赖
+USB workloop。workloop 一旦被复位流程占住，我们的线程就永久挂在那里 —— 线程死了，
+从此没有任何人重试。改成异步 `terminate()`：本轮返回，下一轮再检查占用是否解除。
+
+另外补了 60 秒心跳。以前"没有日志"无法区分「没事发生」和「线程死了」，
+排查时只能靠猜；现在心跳里同时给出看到几个 1505、是否持有接口、累计发了几次报文。
 
 ### 为什么必须另起线程
 
@@ -108,6 +149,7 @@ E398Loader: IOProviderClass = IOResources, IOClass = E398Loader
 | 1.3.0 | start/stop 换成真函数 | kmod 层终于通过 |
 | 1.4.0 | 放弃抢 personality，改 IOResources + 内核线程 | 1000000 分仍抢不过 50000 |
 | 1.5.0 | 永久监视 + `kIOServiceSeize` 优先、terminate 兜底 | 拔插后无人切换 |
+| 1.6.0 | 去掉"发满 6 次就放弃"、发完放开接口、异步 terminate、60 秒心跳 | 断联后永久停在 1505 且无日志 |
 
 ---
 

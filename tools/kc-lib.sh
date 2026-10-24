@@ -25,6 +25,60 @@ KC_BOOT="/System/Library/KernelCollections/BootKernelExtensions.kc"
 KC_SYS="/System/Library/KernelCollections/SystemKernelExtensions.kc"
 KC_KERNEL="/System/Library/Kernels/kernel"
 
+# 日志查询默认只看最近 30 分钟。
+# `log show --last boot --predicate 'eventMessage CONTAINS ...'` 会扫描本次开机以来的
+# 全部日志（CONTAINS 用不上索引）。开机一两天、日志几十万条时，单条命令要几十秒到
+# 几分钟 —— 7-verify 以前就是「卡」在这一步，看起来像内核死锁，其实只是在扫日志。
+# 需要完整 range 时：KC_LOG_FULL=1 ./7-verify.sh
+KC_LOG_MIN="${KC_LOG_MIN:-30}"
+
+# ---------------------------------------------------------------------------
+# 带超时执行一条命令（macOS 没有 coreutils 的 timeout）
+#   $1 = 秒数，其余 = 命令
+#
+# 首选 perl 的 alarm + exec：实测 macOS 上 alarm 会跨 exec 保留（POSIX 允许，
+# Linux/BSD 都是保留的），于是"超时"就是给目标进程自己挂一个闹钟，
+# 快命令零开销、超时精确，也不用管孙进程（sudo 是 exec 过去的，同一个 pid）。
+#   返回：命令自己的退出码；被闹钟打断时是 142（128+SIGALRM）。
+# 万一没有 perl，退回"看门狗子 shell"写法（会慢一点，但行为一致）。
+# ---------------------------------------------------------------------------
+kc_run_timeout() {
+  local secs="$1"; shift
+  if command -v perl >/dev/null 2>&1; then
+    perl -e 'alarm shift; exec @ARGV; die "exec: $!"' "$secs" "$@"
+    return $?
+  fi
+  kc_run_timeout_bash "$secs" "$@"
+}
+
+kc_run_timeout_bash() {
+  local secs="$1"; shift
+  local out pid wd rc
+  out=$(mktemp "${TMPDIR:-/tmp}/e398-to.XXXXXX") || return 1
+  "$@" >"$out" 2>&1 &
+  pid=$!
+  (
+    sleep "$secs"
+    kill -TERM "$pid" 2>/dev/null
+    pkill -TERM -P "$pid" 2>/dev/null
+    sleep 1
+    kill -KILL "$pid" 2>/dev/null
+    pkill -KILL -P "$pid" 2>/dev/null
+  ) >/dev/null 2>&1 &
+  wd=$!
+  wait "$pid" 2>/dev/null
+  rc=$?
+  kill -TERM "$wd" 2>/dev/null
+  pkill -TERM -P "$wd" 2>/dev/null
+  wait "$wd" 2>/dev/null
+  cat "$out" 2>/dev/null
+  rm -f "$out"
+  case "$rc" in
+    143|137) rc=124 ;;
+  esac
+  return $rc
+}
+
 # 集合里某个 kext 的版本号（没有则输出空）
 # 用 kmutil inspect 读，别用 strings：strings 分不清"已经装了"和"报错文本里提到了它"，
 # 而且它看不出装的是哪个版本 —— 这会导致新版本永远装不进去（曾踩过）。
@@ -84,8 +138,11 @@ kc_kmod_start_ok() {  # $1 = kext 路径
 # IORegistry 里是否真有某个类的实例。
 # 注意：ioreg -c 在没有匹配时会【打印整棵 IORegistry 树】（1200+ 行），
 # 所以「输出非空」≠「有实例」——必须到输出里找 "<class 类名,"。
+# 加超时：内核里若有驱动卡在 IOKit 锁上，ioreg 会无限期阻塞（7-verify 的另一个疑似卡点）。
 kc_has_class() {  # $1 = 类名
-  ioreg -w0 -c "$1" 2>/dev/null | grep -q "<class $1,"
+  local out
+  out=$(kc_run_timeout 15 ioreg -w0 -c "$1")
+  echo "$out" | grep -q "<class $1,"
 }
 
 # 内核里是否真的出现了我们的服务实例 —— 这是「kmod 载入成功」唯一可靠的证据。
@@ -99,9 +156,10 @@ kc_has_service() {
 kc_kmod_error() {
   local pred out
   pred='eventMessage CONTAINS "local.e398.switcher"'
-  out=$(log show --last boot --predicate "$pred" --style compact 2>/dev/null)
-  if [ -z "$out" ]; then
-    out=$(sudo -n log show --last boot --predicate "$pred" --style compact 2>/dev/null)
+  if [ "${KC_LOG_FULL:-0}" = "1" ]; then
+    out=$(kc_run_timeout 240 log show --last boot --predicate "$pred" --style compact)
+  else
+    out=$(kc_run_timeout 20 log show --last "${KC_LOG_MIN}m" --predicate "$pred" --style compact)
   fi
   echo "$out" \
     | grep -E "NULL module start pointer|start failed|failed to load|Couldn't alloc class" \
