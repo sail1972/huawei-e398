@@ -1,0 +1,47 @@
+# ---------- 编译产物 ----------
+# tools/ 下的可执行文件由 tools/build.sh 或 5-ppp-dial.sh 自动编译生成
+tools/e398_at
+tools/e398_ppp
+tools/e398_probe
+tools/e398_power
+tools/e398_proxyset
+tools/e398_reenum
+tools/e398_ctrl
+tools/e398_bulk
+tools/e398_scsi
+tools/devdesc
+tools/dumpdesc
+tools/probe
+tools/usb_switch_huawei
+tools/*.o
+tools/*.dSYM
+
+# ---------- 厂商二进制（版权原因不入库） ----------
+# 华为官方驱动与它附带的 kext 从设备虚拟光盘解出，体积大且 macOS 15 上无效
+kext/HuaweiDataCardDriver.kext/
+kext/USBExpressCardCantWake_Huawei.kext/
+# 合成 KDK 的实验残留（内含 Apple System.kext 副本，且该路线已验证无效）
+kdk-fake/
+
+# ---------- 生成文件 ----------
+# 14-tun.sh gen 生成，含本机绝对路径（v2rayN 规则集位置、节点 IP）
+tools/singbox-tun.json
+
+# ---------- 运行期产物 ----------
+diag-*.log
+*.log
+*.pid
+
+# ---------- macOS ----------
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# ---------- 编辑器 ----------
+.vscode/
+.idea/
+*.swp
+
+# 早期方案（只 attach 不 open）的 kext，源码在 archive/
+kext/E398Blocker.kext/

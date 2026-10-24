@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>English</string>
+	<key>CFBundleExecutable</key>
+	<string>E398Switcher</string>
+	<key>CFBundleIdentifier</key>
+	<string>local.e398.switcher</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>E398Switcher</string>
+	<key>CFBundlePackageType</key>
+	<string>KEXT</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.5.0</string>
+	<key>CFBundleVersion</key>
+	<string>1.5.0</string>
+	<key>IOKitPersonalities</key>
+	<dict>
+		<!-- ① 加载挂钩：挂在 IOResources 上。
+		     IOResources 开机必定存在，所以这条 personality 会无条件触发本 kext 的加载，
+		     保证在 USB 枚举之前 kext 就已经在内核里、类已注册、personality 已进入匹配表。
+		     这是 EnergyDriver 能一直常驻内核的原因（它的 personality 就挂在 IOResources）。
+		     没有这一条时，我们的类要先靠 USB 匹配才被加载，而 USB 接口在开机早期就被
+		     苹果的 mass-storage 以 IOProbeScore=50000 抢先匹配（IOMatchedAtBoot=Yes），
+		     形成"没加载→匹配不上→更不会加载"的死结。 -->
+		<key>E398Loader</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>local.e398.switcher</string>
+			<key>IOClass</key>
+			<string>E398Loader</string>
+			<key>IOProviderClass</key>
+			<string>IOResources</string>
+			<key>IOProbeScore</key>
+			<integer>1000</integer>
+		</dict>
+		<!-- ② 真正干活的 personality：只在华为零 CD 的大容量存储接口上匹配 -->
+		<key>E398Switcher</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>local.e398.switcher</string>
+			<key>IOClass</key>
+			<string>E398Switcher</string>
+			<key>IOProviderClass</key>
+			<string>IOUSBHostInterface</string>
+			<!-- 苹果 mass-storage 是 50000，这里必须更高才能抢到接口独占会话 -->
+			<key>IOProbeScore</key>
+			<integer>1000000</integer>
+			<key>idVendor</key>
+			<integer>4817</integer>
+			<key>idProduct</key>
+			<integer>5381</integer>
+			<!-- 只认大容量存储接口（class 8）。1506 模式下的 modem 接口是
+			     class 255/10/2，不会被这条匹配到，因此切换完成后不会抢 modem 驱动。 -->
+			<key>bInterfaceClass</key>
+			<integer>8</integer>
+		</dict>
+	</dict>
+	<key>OSBundleLibraries</key>
+	<dict>
+		<key>com.apple.kpi.iokit</key>
+		<string>8.0.0</string>
+		<key>com.apple.kpi.libkern</key>
+		<string>8.0.0</string>
+		<key>com.apple.kpi.mach</key>
+		<string>8.0.0</string>
+		<key>com.apple.iokit.IOUSBHostFamily</key>
+		<string>1.2</string>
+	</dict>
+	<key>OSBundleRequired</key>
+	<string>Root</string>
+</dict>
+</plist>
