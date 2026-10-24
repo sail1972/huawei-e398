@@ -401,9 +401,9 @@ echo "  AT 通道日志：$PPP_LOG"
 echo "  拨号脚本：  $CHAT_FILE"
 echo
 
-# ⚠ pppd 的 pty 选项是用 `sh -c "<字符串>"` 执行的，而本项目路径里有空格
-#   （/Users/sail/WorkBuddy/华为 E398 驱动/...），整串直接塞进去会被空格切断，
-#   报 `sh: /Users/sail/WorkBuddy/华为: No such file or directory`。
+# ⚠ pppd 的 pty 选项是用 `sh -c "<字符串>"` 执行的，路径里一旦有空格
+#   （例如 ~/My Projects/huawei-e398/...），整串直接塞进去会被空格切断，
+#   报 `sh: /Users/you/My: No such file or directory`。
 #   所以生成一个不含空格的小包装脚本，pty 只指向它。
 cat > "$PTY_CMD" <<EOF
 #!/bin/sh

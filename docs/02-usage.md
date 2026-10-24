@@ -199,7 +199,7 @@ sudo tee /Library/LaunchDaemons/local.e398.keepalive.plist >/dev/null <<'EOF'
   <array>
     <string>/bin/bash</string>
     <string>-lc</string>
-    <string>exec "$HOME/WorkBuddy/华为 E398 驱动/E398/8-ppp-keepalive.sh" watch</string>
+    <string>exec "/Users/you/path/to/huawei-e398/8-ppp-keepalive.sh" watch</string>
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -211,8 +211,12 @@ EOF
 sudo launchctl bootstrap system /Library/LaunchDaemons/local.e398.keepalive.plist
 ```
 
-把 `<string>exec ...</string>` 里的路径改成你实际的绝对路径（**路径有空格也没关系，
-这是 plist 不是 shell 字符串**）。卸载：
+把 `/Users/you/path/to/huawei-e398` 换成你的实际路径。两点注意：
+
+- **别用 `$HOME`**：LaunchDaemon 以 root 身份运行，`$HOME` 是 `/var/root`。
+- 路径里可以有空格，因为命令串里**加了引号**（`exec "…"`）；不加引号就会被切断。
+
+卸载：
 
 ```bash
 sudo launchctl bootout system /Library/LaunchDaemons/local.e398.keepalive.plist
